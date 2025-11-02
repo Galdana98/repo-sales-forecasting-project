@@ -59,3 +59,4 @@ modelo de forecasting para prediccion de ventas
 
 --------
 
+Marvinn De la Cruz Estrada
