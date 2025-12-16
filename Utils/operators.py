@@ -50,5 +50,5 @@ class DateFeatureExtractor(BaseEstimator, TransformerMixin):
             X[var + '_weekday'] = X[var].dt.dayofweek
             
             # Opcional: Eliminar la fecha original si el modelo no la acepta
-            # X.drop(columns=[var], inplace=True)
+            X.drop(columns=[var], inplace=True)
         return X
