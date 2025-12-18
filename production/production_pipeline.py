@@ -1,6 +1,7 @@
 """
-Script de ejecución del pipeline de entrenamiento para Sales Forecasting.
-Integra MLflow para tracking automático de experimentos.
+Script de producción para Sales Forecasting.
+Ejecuta un torneo de modelos (Challengers), registra todo en MLflow
+y selecciona/guarda automáticamente al mejor modelo (Champion).
 """
 
 import os
@@ -9,22 +10,24 @@ import logging
 import joblib
 import pandas as pd
 import numpy as np
-import mlflow # UPGRADE: Importar MLflow
-import mlflow.sklearn # UPGRADE: Importar módulo de sklearn para autolog
+import mlflow
+import mlflow.sklearn
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import ParameterGrid
 from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 
 # Asegurar que se puede importar Utils desde el directorio superior
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Importar operadores personalizados
 try:
     from Utils.operators import DateFeatureExtractor
 except ImportError:
+    # Fallback por si la ejecución es local en la misma carpeta
     from operators import DateFeatureExtractor
 
 # Configuración de Logging
@@ -34,7 +37,9 @@ logging.basicConfig(
 )
 
 def load_data(file_path):
-    """Carga los datos desde un archivo Excel."""
+    """
+    Carga los datos desde un archivo Excel.
+    """
     logging.info("Cargando datos desde: %s", file_path)
     try:
         df_data = pd.read_excel(file_path, sheet_name='Base de Datos')
@@ -42,18 +47,15 @@ def load_data(file_path):
             df_data['Fecha'] = pd.to_datetime(df_data['Fecha'])
             df_data.sort_values('Fecha', inplace=True)
             df_data.reset_index(drop=True, inplace=True)
-        logging.info("Datos cargados exitosamente. Dimensiones: %s", df_data.shape)
         return df_data
-    except FileNotFoundError:
-        logging.error("Error: No se encontró el archivo %s", file_path)
-        raise
-    except Exception as error: # pylint: disable=broad-exception-caught
-        logging.error("Error inesperado al cargar datos: %s", error)
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        logging.error("Error al cargar datos: %s", error)
         raise
 
 def split_data(df_data, target_col):
-    """Divide los datos en train y validation."""
-    logging.info("Dividiendo datos en Train y Validation...")
+    """
+    Divide los datos en train y validation (80/20 cronológico).
+    """
     features = df_data.drop(columns=[target_col])
     target = df_data[target_col]
 
@@ -64,20 +66,20 @@ def split_data(df_data, target_col):
     x_val = features.iloc[split_point:]
     y_val = target.iloc[split_point:]
 
-    logging.info("Split completado. Train: %s, Val: %s", x_train.shape, x_val.shape)
     return x_train, y_train, x_val, y_val
 
-def build_pipeline(x_train):
-    """Construye el pipeline de preprocesamiento y modelado."""
-    logging.info("Configurando el Pipeline...")
+def get_pipeline_structure(model):
+    """
+    Crea la estructura base del pipeline con un modelo dado.
+    """
     date_vars = ['Fecha']
     cat_vars = [
         'Codigo_Cupon', 'Descripcion_Cupon', 'Codigo_Producto',
         'Tipo_Orden', 'Tipo_Pago', 'Canal_Orden'
     ]
     possible_nums = ['Cantidad_Vendida', 'Precio_Menu_GTQ', 'No_Tienda']
-    num_vars = [c for c in possible_nums if c in x_train.columns]
 
+    # Preprocesador
     preprocessor = ColumnTransformer([
         ('date', Pipeline([
             ('extractor', DateFeatureExtractor(date_vars))
@@ -86,82 +88,136 @@ def build_pipeline(x_train):
             ('imputer', SimpleImputer(strategy='most_frequent')),
             ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
         ]), cat_vars),
-        ('num', StandardScaler(), num_vars)
+        ('num', StandardScaler(), possible_nums)
     ], remainder='drop')
 
-    model_pipeline = Pipeline([
+    pipeline = Pipeline([
         ('preprocessor', preprocessor),
-        ('model', RandomForestRegressor(n_estimators=150, random_state=2025, n_jobs=-1))
+        ('model', model)
     ])
 
-    return model_pipeline
+    return pipeline
 
-def train_and_evaluate(pipeline, x_train, y_train, x_val, y_val):
-    """Entrena el pipeline y evalúa su desempeño."""
-    logging.info("Iniciando entrenamiento del modelo...")
-    pipeline.fit(x_train, y_train)
-    logging.info("Entrenamiento finalizado.")
+def get_models_config():
+    """
+    Define los modelos y sus hiperparámetros para el torneo (Challengers).
+    """
+    return {
+        'Ridge': {
+            'model': Ridge(random_state=2025),
+            'params': {'model__alpha': [0.1, 1.0]}
+        },
+        'Lasso': {
+            'model': Lasso(random_state=2025),
+            'params': {'model__alpha': [0.01, 1.0]}
+        },
+        'RandomForest': {
+            'model': RandomForestRegressor(random_state=2025, n_jobs=-1),
+            # Reducido un poco para que la ejecución no sea eterna
+            'params': {'model__n_estimators': [50, 100]}
+        },
+        'GradientBoosting': {
+            'model': GradientBoostingRegressor(random_state=2025),
+            'params': {'model__learning_rate': [0.1, 0.2]}
+        }
+    }
 
-    logging.info("Evaluando modelo...")
-    preds = pipeline.predict(x_val)
-    rmse = np.sqrt(mean_squared_error(y_val, preds))
-    logging.info("Validación RMSE: %.2f", rmse)
-    
-    # UPGRADE: Registrar métrica manual adicional si se desea (opcional con autolog)
-    mlflow.log_metric("validation_rmse", rmse) #
+def run_tournament(x_train, y_train, x_val, y_val):
+    """
+    Ejecuta el torneo de modelos (Challengers) y devuelve el mejor (Champion).
+    """
+    models_config = get_models_config()
+    best_rmse = float('inf')
+    best_model_pipeline = None
+    best_name = None
 
-def save_pipeline(pipeline, output_path):
-    """Guarda el pipeline entrenado en disco."""
-    logging.info("Guardando artefacto localmente en: %s", output_path)
-    try:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        joblib.dump(pipeline, output_path)
-        logging.info("Pipeline guardado exitosamente.")
-    except OSError as error:
-        logging.error("Error de sistema al guardar el pipeline: %s", error)
-        raise
+    for name, config in models_config.items():
+        logging.info("Evaluando familia de modelos: %s", name)
+
+        # Crear pipeline base con el modelo actual
+        base_pipeline = get_pipeline_structure(config['model'])
+
+        # Generar combinaciones de hiperparámetros
+        param_grid = list(ParameterGrid(config['params']))
+
+        for params in param_grid:
+            run_name = f"Challenger_{name}"
+
+            # --- MLflow Nested Run (Cada modelo es un Challenger) ---
+            with mlflow.start_run(run_name=run_name, nested=True):
+                # Configurar parámetros
+                current_pipeline = base_pipeline.set_params(**params)
+
+                # Entrenar
+                current_pipeline.fit(x_train, y_train)
+
+                # Evaluar
+                preds = current_pipeline.predict(x_val)
+                rmse = np.sqrt(mean_squared_error(y_val, preds))
+
+                # Registrar en MLflow
+                mlflow.log_params(params)
+                mlflow.log_param("model_family", name)
+                mlflow.log_metric("rmse", rmse)
+                
+                # Tag clave para identificar Challengers
+                mlflow.set_tag("model_role", "Challenger")
+
+                logging.info("  -> %s | RMSE: %.2f", params, rmse)
+
+                # Selección del Champion (Campeón)
+                if rmse < best_rmse:
+                    best_rmse = rmse
+                    best_model_pipeline = current_pipeline
+                    best_name = name
+
+    return best_model_pipeline, best_rmse, best_name
 
 def main():
     """Función principal de ejecución."""
-    # Configuración de rutas
+    # Rutas
     raw_data_path = '../data/raw/data_sales_forecasting.xlsx'
     model_output_path = '../models/sales_forecasting_pipeline_prod.pkl'
     target_variable = 'Venta_Neta_GTQ'
 
-    logging.info(">>> Iniciando Pipeline de Producción MLOps <<<")
+    # Configuración MLflow
+    mlflow.set_tracking_uri("http://127.0.0.1:5000")
+    mlflow.set_experiment("Sales_Forecasting_Production_Script")
 
-    # UPGRADE: Configuración de MLflow
-    mlflow.set_tracking_uri("http://127.0.0.1:5000") 
-    mlflow.set_experiment("Sales_Forecasting_Experiment")
-    
-    # UPGRADE: Activar Tracking Automático (Autolog)
-    # Esto registra params, métricas y el modelo automáticamente
-    mlflow.sklearn.autolog()
+    logging.info(">>> Iniciando Pipeline de Producción (Torneo de Modelos) <<<")
 
     try:
-        # UPGRADE: Iniciar la corrida de MLflow
-        with mlflow.start_run(run_name="RandomForest_Prod_Run"):
-            
-            # 1. Cargar Datos
-            df_data = load_data(raw_data_path)
+        # 1. Cargar y Dividir Datos
+        df_data = load_data(raw_data_path)
+        x_train, y_train, x_val, y_val = split_data(df_data, target_variable)
 
-            # 2. Split de Datos
-            x_train, y_train, x_val, y_val = split_data(df_data, target_variable)
+        # 2. Iniciar Corrida Padre en MLflow (Ciclo de Entrenamiento)
+        with mlflow.start_run(run_name="Production_Training_Cycle"):
 
-            # 3. Construir Pipeline
-            pipeline = build_pipeline(x_train)
+            # 3. Ejecutar Torneo
+            champion_pipeline, champion_rmse, champion_name = run_tournament(
+                x_train, y_train, x_val, y_val
+            )
 
-            # 4. Entrenar y Evaluar (Todo lo que ocurra aquí se registrará en MLflow)
-            train_and_evaluate(pipeline, x_train, y_train, x_val, y_val)
+            logging.info(">>> CAMPEÓN DEFINITIVO: %s con RMSE: %.2f <<<",
+                         champion_name, champion_rmse)
 
-            # 5. Guardar Modelo Local
-            save_pipeline(pipeline, model_output_path)
-            
-            # (El modelo también se guarda automáticamente en MLflow gracias a autolog)
+            # 4. Registrar al Champion en MLflow (Inciso b)
+            mlflow.log_metric("champion_rmse", champion_rmse)
+            mlflow.set_tag("winner_model", champion_name)
+            mlflow.set_tag("model_role", "Champion")
 
-        logging.info(">>> Pipeline ejecutado y registrado en MLflow correctamente <<<")
+            # Guardar el artefacto en MLflow
+            mlflow.sklearn.log_model(champion_pipeline, "champion_model_artifact")
 
-    except Exception as main_error: # pylint: disable=broad-exception-caught
+            # 5. Guardar modelo físico localmente
+            os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
+            joblib.dump(champion_pipeline, model_output_path)
+            logging.info("Pipeline guardado exitosamente en: %s", model_output_path)
+
+        logging.info(">>> Pipeline finalizado exitosamente <<<")
+
+    except Exception as main_error:  # pylint: disable=broad-exception-caught
         logging.critical("El proceso falló: %s", main_error)
         sys.exit(1)
 
